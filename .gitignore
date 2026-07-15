@@ -1,0 +1,4 @@
+.venv/
+.pio/
+include/secrets.h
+.claude/settings.local.json
