@@ -38,6 +38,7 @@ struct Settings {
   uint8_t  effect     = FX_SOLID;
   uint8_t  speed      = 128;         // effect speed, 1..255
   bool     use12h     = false;       // false = 24h
+  bool     colonBlink = true;        // clock colon blinks at 1 Hz when true
   uint16_t timerDur   = 300;         // timer duration, seconds (default 5 min)
   // Night dimming
   bool     nightDim    = false;
@@ -127,6 +128,7 @@ void loadSettings() {
   settings.effect      = prefs.getUChar("effect",  settings.effect);
   settings.speed       = prefs.getUChar("speed",   settings.speed);
   settings.use12h      = prefs.getBool ("use12h",  settings.use12h);
+  settings.colonBlink  = prefs.getBool ("cblink",  settings.colonBlink);
   settings.timerDur    = prefs.getUShort("tdur",   settings.timerDur);
   settings.nightDim    = prefs.getBool ("ndim",    settings.nightDim);
   settings.nightStart  = prefs.getUShort("nstart", settings.nightStart);
@@ -143,6 +145,7 @@ void saveSettings() {
   prefs.putUChar ("effect",  settings.effect);
   prefs.putUChar ("speed",   settings.speed);
   prefs.putBool  ("use12h",  settings.use12h);
+  prefs.putBool  ("cblink",  settings.colonBlink);
   prefs.putUShort("tdur",    settings.timerDur);
   prefs.putBool  ("ndim",    settings.nightDim);
   prefs.putUShort("nstart",  settings.nightStart);
@@ -232,7 +235,7 @@ void renderClock() {
   drawDigitFX(1, d1);
   drawDigitFX(2, d2);
   drawDigitFX(3, d3);
-  drawColon((t.tm_sec % 2) == 0);     // colon keeps its own color, 1 Hz blink
+  drawColon(settings.colonBlink ? ((t.tm_sec % 2) == 0) : true);   // colon: blink or solid
 
   FastLED.show();
 
@@ -325,12 +328,18 @@ void renderColorMap() {
 }
 
 // Brief power-on self-test: show "88:88" so every segment + the colon
-// lights. Good sanity check on wiring and PSU headroom.
+// lights. Runs at a fixed LOW brightness — lighting all ~280 LEDs at full
+// brightness right at boot can brown out the ESP32 and cause a reset loop
+// when running on the LED supply alone. Restores the real brightness after.
 void selfTest() {
+  uint8_t saved = FastLED.getBrightness();
+  FastLED.setBrightness(30);
   clearAll();
   for (int d = 0; d < NUM_DIGITS; d++) drawDigit(d, 8, colorOn);
   drawColon(true);
   FastLED.show();
+  delay(1500);
+  FastLED.setBrightness(saved);
 }
 
 // ---------------------------------------------------------------------
@@ -422,11 +431,12 @@ void sendState() {
   snprintf(buf, sizeof(buf),
            "{\"mode\":\"%s\",\"disp\":\"%s\",\"running\":%d,"
            "\"brightness\":%u,\"color\":\"%06X\",\"colon\":\"%06X\","
-           "\"effect\":%u,\"speed\":%u,\"fmt\":%u,\"tdur\":%u,"
+           "\"effect\":%u,\"speed\":%u,\"fmt\":%u,\"cblink\":%d,\"tdur\":%u,"
            "\"ndim\":%d,\"nstart\":%u,\"nend\":%u,\"nbright\":%u,\"nactive\":%d}",
            modeStr, disp, running ? 1 : 0,
            settings.brightness, settings.color & 0xFFFFFF, settings.colonColor & 0xFFFFFF,
-           settings.effect, settings.speed, settings.use12h ? 12 : 24, settings.timerDur,
+           settings.effect, settings.speed, settings.use12h ? 12 : 24,
+           settings.colonBlink ? 1 : 0, settings.timerDur,
            settings.nightDim ? 1 : 0, settings.nightStart, settings.nightEnd, settings.nightBright,
            nightActive ? 1 : 0);
   server.send(200, "application/json", buf);
@@ -453,6 +463,8 @@ void handleSet() {
     settings.speed = constrain(server.arg("speed").toInt(), 1, 255);
   if (server.hasArg("fmt"))
     settings.use12h = (server.arg("fmt").toInt() == 12);
+  if (server.hasArg("cblink"))
+    settings.colonBlink = (server.arg("cblink").toInt() == 1);
   if (server.hasArg("tdur"))
     timerSetDuration(constrain(server.arg("tdur").toInt(), 1, 99 * 60 + 59));
   if (server.hasArg("ndim"))
@@ -499,6 +511,7 @@ void handleUpdateUpload() {
       otaAuthed = server.authenticate("admin", OTA_PASSWORD);
       if (!otaAuthed) return;                 // gate before touching flash
       mode = MODE_CLOCK;
+      FastLED.setBrightness(30);              // keep OTA lights dim (brown-out safe)
       Serial.printf("OTA(http): start %s\n", up.filename.c_str());
       if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
       break;
@@ -593,8 +606,7 @@ void setup() {
   clearAll();
   FastLED.show();
 
-  selfTest();          // flash 88:88 so we can eyeball the wiring
-  delay(1500);
+  selfTest();          // dim 88:88 so we can eyeball the wiring (brown-out safe)
 
   connectWiFi();
   startTime();

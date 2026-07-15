@@ -121,6 +121,13 @@ const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
         <label>Colon color</label>
         <input type="color" id="colon" value="#ff7800">
       </div>
+      <div class="row">
+        <label>Colon blink</label>
+        <div class="seg" id="cblink">
+          <button data-c="0">Solid</button>
+          <button data-c="1">Blink</button>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -217,6 +224,7 @@ function paint(s) {
   const cur = s.color.toLowerCase();
   document.querySelectorAll('#effect button').forEach(b => b.classList.toggle('on', +b.dataset.e === s.effect));
   document.querySelectorAll('#fmt button').forEach(b => b.classList.toggle('on', +b.dataset.f === s.fmt));
+  document.querySelectorAll('#cblink button').forEach(b => b.classList.toggle('on', +b.dataset.c === (s.cblink ? 1 : 0)));
   document.querySelectorAll('#swatches button').forEach(b => b.classList.toggle('on', b.dataset.hex.toLowerCase() === cur));
 
   // night dimming
@@ -254,6 +262,7 @@ $('#bright').addEventListener('input', e => {
 ['input','change'].forEach(ev => $('#colon').addEventListener(ev, e => send({colon: e.target.value.replace('#','')})));
 document.querySelectorAll('#effect button').forEach(b => b.addEventListener('click', () => send({effect: b.dataset.e})));
 document.querySelectorAll('#fmt button').forEach(b => b.addEventListener('click', () => send({fmt: b.dataset.f})));
+document.querySelectorAll('#cblink button').forEach(b => b.addEventListener('click', () => send({cblink: b.dataset.c})));
 $('#speed').addEventListener('input', e => {
   $('#sval').textContent = e.target.value;
   clearTimeout(t2); t2 = setTimeout(() => send({speed: e.target.value}), 120);
