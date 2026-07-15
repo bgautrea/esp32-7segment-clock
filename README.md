@@ -58,7 +58,8 @@ DHCP reservation (or `clock.local`) keeps the address stable.
 
 ## First-time setup
 
-1. Edit `include/secrets.h` — put in your WiFi SSID and password.
+1. Copy `include/secrets.h.example` to `include/secrets.h` and fill in your
+   WiFi SSID and password (this file is gitignored, so it stays local).
 2. Build + upload (commands above).
 3. Open the serial monitor. On boot it flashes **88:88** (self-test), joins WiFi,
    and queries NTP at `192.168.0.156`. Once synced it shows the time.
