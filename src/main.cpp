@@ -19,7 +19,7 @@
 
 CRGB leds[LED_COUNT];
 
-enum Mode { MODE_CLOCK, MODE_CALIBRATE, MODE_MAP };
+enum Mode { MODE_CLOCK, MODE_STOPWATCH, MODE_TIMER, MODE_CALIBRATE, MODE_MAP };
 Mode    mode        = MODE_CLOCK;
 bool    timeSynced  = false;
 
@@ -38,10 +38,35 @@ struct Settings {
   uint8_t  effect     = FX_SOLID;
   uint8_t  speed      = 128;         // effect speed, 1..255
   bool     use12h     = false;       // false = 24h
+  uint16_t timerDur   = 300;         // timer duration, seconds (default 5 min)
+  // Night dimming
+  bool     nightDim    = false;
+  uint16_t nightStart  = 22 * 60;    // minutes since midnight (22:00)
+  uint16_t nightEnd    = 7  * 60;    // 07:00
+  uint8_t  nightBright = 8;          // dimmed brightness during the window
 };
 Settings settings;
 
 uint8_t gHue = 0;                     // animated hue base for effects
+
+// ---- Stopwatch / timer runtime state (not persisted) ----
+bool     swRunning  = false;
+uint32_t swAccumMs  = 0;              // elapsed accumulated while paused
+uint32_t swStartMs  = 0;              // millis() at last start
+
+bool     timerRunning   = false;
+bool     timerFinished  = false;
+uint32_t timerEndMs     = 0;          // millis() when it hits 0 (while running)
+uint32_t timerRemainMs_ = 0;          // remaining while paused
+
+uint32_t swElapsedMs() {
+  return swRunning ? swAccumMs + (millis() - swStartMs) : swAccumMs;
+}
+uint32_t timerRemaining() {
+  if (timerFinished) return 0;
+  if (timerRunning) { uint32_t now = millis(); return now < timerEndMs ? timerEndMs - now : 0; }
+  return timerRemainMs_;
+}
 
 // Derived display colors, refreshed by applySettings().
 CRGB colorOn    = CRGB(255, 120, 0);
@@ -64,8 +89,28 @@ const CRGB RUN_COLORS[7] = {
 // ---------------------------------------------------------------------
 //  Settings (persisted to NVS)
 // ---------------------------------------------------------------------
+// True if the given minute-of-day falls in the night-dimming window
+// (handles windows that wrap past midnight, e.g. 22:00 -> 07:00).
+bool inNightWindow(int nowMin) {
+  int s = settings.nightStart, e = settings.nightEnd;
+  if (s == e) return false;
+  return (s < e) ? (nowMin >= s && nowMin < e)
+                 : (nowMin >= s || nowMin < e);
+}
+
+// Effective brightness right now, accounting for night dimming.
+uint8_t effectiveBrightness() {
+  if (!settings.nightDim) return settings.brightness;
+  struct tm t;
+  if (!getLocalTime(&t, 5)) return settings.brightness;   // no time yet
+  int nowMin = t.tm_hour * 60 + t.tm_min;
+  return inNightWindow(nowMin) ? settings.nightBright : settings.brightness;
+}
+
+void updateBrightness() { FastLED.setBrightness(effectiveBrightness()); }
+
 void applySettings() {
-  FastLED.setBrightness(settings.brightness);
+  updateBrightness();
   colorOn    = CRGB((settings.color >> 16) & 0xFF,
                     (settings.color >> 8)  & 0xFF,
                     (settings.color)       & 0xFF);
@@ -76,23 +121,33 @@ void applySettings() {
 
 void loadSettings() {
   prefs.begin("clock", true);
-  settings.brightness = prefs.getUChar("bright", settings.brightness);
-  settings.color      = prefs.getULong("color",  settings.color);
-  settings.colonColor = prefs.getULong("colon",  settings.colonColor);
-  settings.effect     = prefs.getUChar("effect", settings.effect);
-  settings.speed      = prefs.getUChar("speed",  settings.speed);
-  settings.use12h     = prefs.getBool ("use12h", settings.use12h);
+  settings.brightness  = prefs.getUChar("bright",  settings.brightness);
+  settings.color       = prefs.getULong("color",   settings.color);
+  settings.colonColor  = prefs.getULong("colon",   settings.colonColor);
+  settings.effect      = prefs.getUChar("effect",  settings.effect);
+  settings.speed       = prefs.getUChar("speed",   settings.speed);
+  settings.use12h      = prefs.getBool ("use12h",  settings.use12h);
+  settings.timerDur    = prefs.getUShort("tdur",   settings.timerDur);
+  settings.nightDim    = prefs.getBool ("ndim",    settings.nightDim);
+  settings.nightStart  = prefs.getUShort("nstart", settings.nightStart);
+  settings.nightEnd    = prefs.getUShort("nend",   settings.nightEnd);
+  settings.nightBright = prefs.getUChar("nbright", settings.nightBright);
   prefs.end();
 }
 
 void saveSettings() {
   prefs.begin("clock", false);
-  prefs.putUChar("bright", settings.brightness);
-  prefs.putULong("color",  settings.color);
-  prefs.putULong("colon",  settings.colonColor);
-  prefs.putUChar("effect", settings.effect);
-  prefs.putUChar("speed",  settings.speed);
-  prefs.putBool ("use12h", settings.use12h);
+  prefs.putUChar ("bright",  settings.brightness);
+  prefs.putULong ("color",   settings.color);
+  prefs.putULong ("colon",   settings.colonColor);
+  prefs.putUChar ("effect",  settings.effect);
+  prefs.putUChar ("speed",   settings.speed);
+  prefs.putBool  ("use12h",  settings.use12h);
+  prefs.putUShort("tdur",    settings.timerDur);
+  prefs.putBool  ("ndim",    settings.nightDim);
+  prefs.putUShort("nstart",  settings.nightStart);
+  prefs.putUShort("nend",    settings.nightEnd);
+  prefs.putUChar ("nbright", settings.nightBright);
   prefs.end();
 }
 
@@ -188,6 +243,71 @@ void renderClock() {
   }
 }
 
+// Draw a duration as MM:SS (or HH:MM once it passes 60 min), using the active
+// color effect for the digits. Leading zeros are shown.
+void drawCounter(uint32_t secs, bool colonOn) {
+  int a, b, c, d;
+  if (secs < 6000) {                    // < 100 minutes -> MM:SS
+    int m = secs / 60, s = secs % 60;
+    a = m / 10; b = m % 10; c = s / 10; d = s % 10;
+  } else {                              // HH:MM
+    uint32_t mins = secs / 60;
+    int h = mins / 60, m = mins % 60;
+    if (h > 99) h = 99;
+    a = h / 10; b = h % 10; c = m / 10; d = m % 10;
+  }
+  gHue = (uint8_t)((millis() * (settings.speed + 1)) >> 10);
+  clearAll();
+  drawDigitFX(0, a); drawDigitFX(1, b); drawDigitFX(2, c); drawDigitFX(3, d);
+  drawColon(colonOn);
+  FastLED.show();
+}
+
+void renderStopwatch() {
+  uint32_t secs = swElapsedMs() / 1000;
+  bool colonOn = swRunning ? true : ((millis() / 350) % 2 == 0);  // blink when paused
+  drawCounter(secs, colonOn);
+}
+
+void renderTimer() {
+  if (timerRunning && timerRemaining() == 0) { timerRunning = false; timerFinished = true; }
+
+  if (timerFinished) {                  // alarm: flash 00:00 red at ~1.5 Hz
+    clearAll();
+    if ((millis() / 350) % 2 == 0) {
+      for (int i = 0; i < NUM_DIGITS; i++) drawDigit(i, 0, CRGB::Red);
+      for (int i = 0; i < COLON_COUNT; i++) leds[COLON_LEDS[i]] = CRGB::Red;
+    }
+    FastLED.show();
+    return;
+  }
+  uint32_t secs = (timerRemaining() + 999) / 1000;   // ceil so it counts ...2,1,0
+  bool colonOn = timerRunning ? true : ((millis() / 350) % 2 == 0);
+  drawCounter(secs, colonOn);
+}
+
+// ---- Stopwatch / timer controls ----
+void swStart()  { if (!swRunning) { swStartMs = millis(); swRunning = true; } }
+void swPause()  { if (swRunning) { swAccumMs += millis() - swStartMs; swRunning = false; } }
+void swReset()  { swRunning = false; swAccumMs = 0; }
+
+void timerReset() {
+  timerRunning = false; timerFinished = false;
+  timerRemainMs_ = (uint32_t)settings.timerDur * 1000;
+}
+void timerStart() {
+  if (timerFinished) { timerFinished = false; timerRemainMs_ = (uint32_t)settings.timerDur * 1000; }
+  if (!timerRunning && timerRemainMs_ > 0) { timerEndMs = millis() + timerRemainMs_; timerRunning = true; }
+}
+void timerPause() {
+  if (timerRunning) { timerRemainMs_ = timerRemaining(); timerRunning = false; }
+}
+void timerSetDuration(uint16_t secs) {
+  settings.timerDur = secs;
+  if (!timerRunning) { timerFinished = false; timerRemainMs_ = (uint32_t)secs * 1000; }
+  saveSettings();
+}
+
 void renderCalibrate() {
   clearAll();
   lightRun(calDigit, calRun, CRGB::Green);
@@ -262,27 +382,65 @@ void handleSerial() {
 // ---------------------------------------------------------------------
 //  Web interface
 // ---------------------------------------------------------------------
+void fmtCounter(uint32_t secs, char* out, size_t n) {
+  if (secs < 6000) { snprintf(out, n, "%02u:%02u", (unsigned)(secs / 60), (unsigned)(secs % 60)); }
+  else {
+    uint32_t mins = secs / 60, h = mins / 60;
+    snprintf(out, n, "%02u:%02u", (unsigned)(h > 99 ? 99 : h), (unsigned)(mins % 60));
+  }
+}
+
 void sendState() {
-  // Current time formatted per the 12/24h setting (leading zero blanked in 12h).
+  // Clock time formatted per the 12/24h setting (leading zero blanked in 12h).
   char timeStr[8] = "--:--";
+  bool haveTime = false; int nowMin = 0;
   struct tm t;
   if (getLocalTime(&t, 5)) {
+    haveTime = true; nowMin = t.tm_hour * 60 + t.tm_min;
     int d0, d1, d2, d3; bool blankLeading;
     clockDigits(t, d0, d1, d2, d3, blankLeading);
     if (blankLeading) snprintf(timeStr, sizeof(timeStr), "%d:%d%d", d1, d2, d3);
     else              snprintf(timeStr, sizeof(timeStr), "%d%d:%d%d", d0, d1, d2, d3);
   }
-  char buf[220];
+  bool nightActive = settings.nightDim && haveTime && inNightWindow(nowMin);
+
+  // Active-mode display string + mode name + running flag.
+  const char* modeStr = "clock";
+  bool running = false;
+  char disp[12];
+  strncpy(disp, timeStr, sizeof(disp));
+  if (mode == MODE_STOPWATCH) {
+    modeStr = "stopwatch"; running = swRunning;
+    fmtCounter(swElapsedMs() / 1000, disp, sizeof(disp));
+  } else if (mode == MODE_TIMER) {
+    modeStr = "timer"; running = timerRunning;
+    if (timerFinished) strncpy(disp, "DONE", sizeof(disp));
+    else fmtCounter((timerRemaining() + 999) / 1000, disp, sizeof(disp));
+  }
+
+  char buf[380];
   snprintf(buf, sizeof(buf),
-           "{\"time\":\"%s\",\"brightness\":%u,\"color\":\"%06X\",\"colon\":\"%06X\","
-           "\"effect\":%u,\"speed\":%u,\"fmt\":%u}",
-           timeStr, settings.brightness, settings.color & 0xFFFFFF,
-           settings.colonColor & 0xFFFFFF, settings.effect, settings.speed,
-           settings.use12h ? 12 : 24);
+           "{\"mode\":\"%s\",\"disp\":\"%s\",\"running\":%d,"
+           "\"brightness\":%u,\"color\":\"%06X\",\"colon\":\"%06X\","
+           "\"effect\":%u,\"speed\":%u,\"fmt\":%u,\"tdur\":%u,"
+           "\"ndim\":%d,\"nstart\":%u,\"nend\":%u,\"nbright\":%u,\"nactive\":%d}",
+           modeStr, disp, running ? 1 : 0,
+           settings.brightness, settings.color & 0xFFFFFF, settings.colonColor & 0xFFFFFF,
+           settings.effect, settings.speed, settings.use12h ? 12 : 24, settings.timerDur,
+           settings.nightDim ? 1 : 0, settings.nightStart, settings.nightEnd, settings.nightBright,
+           nightActive ? 1 : 0);
   server.send(200, "application/json", buf);
 }
 
+void setModeByName(const String& m) {
+  if      (m == "clock")     mode = MODE_CLOCK;
+  else if (m == "stopwatch") mode = MODE_STOPWATCH;
+  else if (m == "timer")     mode = MODE_TIMER;
+}
+
 void handleSet() {
+  if (server.hasArg("mode"))
+    setModeByName(server.arg("mode"));
   if (server.hasArg("brightness"))
     settings.brightness = constrain(server.arg("brightness").toInt(), 0, 255);
   if (server.hasArg("color"))
@@ -295,9 +453,35 @@ void handleSet() {
     settings.speed = constrain(server.arg("speed").toInt(), 1, 255);
   if (server.hasArg("fmt"))
     settings.use12h = (server.arg("fmt").toInt() == 12);
+  if (server.hasArg("tdur"))
+    timerSetDuration(constrain(server.arg("tdur").toInt(), 1, 99 * 60 + 59));
+  if (server.hasArg("ndim"))
+    settings.nightDim = (server.arg("ndim").toInt() == 1);
+  if (server.hasArg("nstart"))
+    settings.nightStart = constrain(server.arg("nstart").toInt(), 0, 1439);
+  if (server.hasArg("nend"))
+    settings.nightEnd = constrain(server.arg("nend").toInt(), 0, 1439);
+  if (server.hasArg("nbright"))
+    settings.nightBright = constrain(server.arg("nbright").toInt(), 1, 255);
 
   applySettings();
   saveSettings();
+  sendState();
+}
+
+// Transient stopwatch/timer actions (start/pause/reset), applied to the
+// active mode. Not persisted.
+void handleAction() {
+  String a = server.arg("do");
+  if (mode == MODE_STOPWATCH) {
+    if      (a == "start") swStart();
+    else if (a == "pause") swPause();
+    else if (a == "reset") swReset();
+  } else if (mode == MODE_TIMER) {
+    if      (a == "start") timerStart();
+    else if (a == "pause") timerPause();
+    else if (a == "reset") timerReset();
+  }
   sendState();
 }
 
@@ -364,6 +548,7 @@ void startWebServer() {
   server.on("/", []() { server.send_P(200, "text/html", INDEX_HTML); });
   server.on("/state", sendState);
   server.on("/set", handleSet);
+  server.on("/action", handleAction);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.begin();
   Serial.printf("Web UI: http://%s/\n", WiFi.localIP().toString().c_str());
@@ -401,6 +586,7 @@ void setup() {
   Serial.println(F("\n\n7-seg WS2812 clock booting..."));
 
   loadSettings();
+  timerRemainMs_ = (uint32_t)settings.timerDur * 1000;   // preload timer
 
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, LED_COUNT);
   applySettings();     // sets brightness + colors from saved settings
@@ -430,21 +616,25 @@ void loop() {
   handleSerial();
   server.handleClient();
 
-  // keep WiFi alive
+  // keep WiFi alive + re-evaluate night dimming
   static uint32_t lastWifiCheck = 0;
   if (millis() - lastWifiCheck > 5000) {
     lastWifiCheck = millis();
     if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+    updateBrightness();
   }
 
-  if (mode == MODE_CLOCK) {
-    // Animate at ~30 fps for effects; a lazy 250 ms is plenty when solid.
-    uint32_t interval = (settings.effect == FX_SOLID) ? 250 : 33;
+  if (mode == MODE_CLOCK || mode == MODE_STOPWATCH || mode == MODE_TIMER) {
+    // Animate at ~30 fps for effects (and the timer alarm); 250 ms otherwise.
+    bool fast = (settings.effect != FX_SOLID) || (mode == MODE_TIMER && timerFinished);
+    uint32_t interval = fast ? 33 : 250;
     static uint32_t lastDraw = 0;
     if (millis() - lastDraw >= interval) {
       lastDraw = millis();
-      renderClock();
+      if      (mode == MODE_CLOCK)     renderClock();
+      else if (mode == MODE_STOPWATCH) renderStopwatch();
+      else                             renderTimer();
     }
   }
-  // calibrate mode only redraws on command
+  // calibrate / color-map modes only redraw on command
 }

@@ -102,4 +102,5 @@ run actually is, and record it. Then fix `SEG_RUN[digit][segment]` in
 - [x] Calibrated segment map + digit order (right-to-left chain)
 - [x] Web UI (brightness, colors, effects, 12/24h) at http://clock.local — settings persist to NVS
 - [x] OTA firmware updates (HTTP push, browser or curl)
-- [ ] Stopwatch + timer modes
+- [x] Stopwatch + timer modes (start/pause/reset, timer alarm)
+- [x] Night dimming (auto-lower brightness on a configurable schedule)
