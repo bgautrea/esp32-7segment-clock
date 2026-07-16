@@ -185,7 +185,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
 
 <script>
 const $ = s => document.querySelector(s);
-let t, t2, t3;                            // debounce timers
+let t, t2, t3, t4, t5;                    // debounce timers
 let st = {};                              // last known state
 const focused = el => document.activeElement === el;
 const min2hhmm = m => String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');
@@ -258,8 +258,14 @@ $('#bright').addEventListener('input', e => {
   $('#bval').textContent = e.target.value;
   clearTimeout(t); t = setTimeout(() => send({brightness: e.target.value}), 120);
 });
-['input','change'].forEach(ev => $('#color').addEventListener(ev, e => send({color: e.target.value.replace('#','')})));
-['input','change'].forEach(ev => $('#colon').addEventListener(ev, e => send({colon: e.target.value.replace('#','')})));
+['input','change'].forEach(ev => $('#color').addEventListener(ev, e => {
+  const v = e.target.value.replace('#','');
+  clearTimeout(t4); t4 = setTimeout(() => send({color: v}), 150);
+}));
+['input','change'].forEach(ev => $('#colon').addEventListener(ev, e => {
+  const v = e.target.value.replace('#','');
+  clearTimeout(t5); t5 = setTimeout(() => send({colon: v}), 150);
+}));
 document.querySelectorAll('#effect button').forEach(b => b.addEventListener('click', () => send({effect: b.dataset.e})));
 document.querySelectorAll('#fmt button').forEach(b => b.addEventListener('click', () => send({fmt: b.dataset.f})));
 document.querySelectorAll('#cblink button').forEach(b => b.addEventListener('click', () => send({cblink: b.dataset.c})));

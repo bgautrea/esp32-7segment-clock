@@ -19,6 +19,12 @@
 // power-ons gentle until the PSU / power-injection is verified.
 #define DEFAULT_BRIGHTNESS 40     // 0-255
 
+// Global current cap. FastLED auto-scales brightness at show() time so a frame
+// can never pull more than this, which keeps a bright config from sagging the
+// shared 5 V rail and browning out / reset-looping the ESP32. Plenty bright for
+// a clock; raise it if you add proper power injection.
+#define MAX_MILLIAMPS 8000        // 8 A @ 5 V
+
 // ---------- Chain layout ----------
 // Chain blocks, walking from the data-input end:
 //   blkA [0..69]  connHH [70..71]  blkB [72..141]  cross [142..155]

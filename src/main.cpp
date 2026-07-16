@@ -76,6 +76,13 @@ CRGB colorColon = CRGB(255, 120, 0);
 Preferences prefs;
 WebServer   server(80);
 
+// Settings are committed to flash lazily: a change marks them dirty and the
+// loop commits once things settle. Keeps a burst of /set requests from
+// hammering NVS (and blocking the loop) on every request.
+bool     settingsDirty   = false;
+uint32_t settingsDirtyMs = 0;
+void markSettingsDirty() { settingsDirty = true; settingsDirtyMs = millis(); }
+
 // Calibration cursor.
 int  calDigit = 0;
 int  calRun   = 0;
@@ -308,7 +315,7 @@ void timerPause() {
 void timerSetDuration(uint16_t secs) {
   settings.timerDur = secs;
   if (!timerRunning) { timerFinished = false; timerRemainMs_ = (uint32_t)secs * 1000; }
-  saveSettings();
+  markSettingsDirty();
 }
 
 void renderCalibrate() {
@@ -476,8 +483,8 @@ void handleSet() {
   if (server.hasArg("nbright"))
     settings.nightBright = constrain(server.arg("nbright").toInt(), 1, 255);
 
-  applySettings();
-  saveSettings();
+  applySettings();          // instant live preview
+  markSettingsDirty();      // flash commit is deferred to the loop
   sendState();
 }
 
@@ -602,6 +609,7 @@ void setup() {
   timerRemainMs_ = (uint32_t)settings.timerDur * 1000;   // preload timer
 
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, LED_COUNT);
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MILLIAMPS);  // brown-out guard
   applySettings();     // sets brightness + colors from saved settings
   clearAll();
   FastLED.show();
@@ -627,6 +635,12 @@ void setup() {
 void loop() {
   handleSerial();
   server.handleClient();
+
+  // Commit settings to flash once changes have settled (see markSettingsDirty).
+  if (settingsDirty && millis() - settingsDirtyMs > 1500) {
+    settingsDirty = false;
+    saveSettings();
+  }
 
   // keep WiFi alive + re-evaluate night dimming
   static uint32_t lastWifiCheck = 0;
