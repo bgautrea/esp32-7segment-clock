@@ -5,11 +5,29 @@
 //  can map physical LED runs to logical segments on the bench.
 // =====================================================================
 #include <Arduino.h>
+
+// MUST precede <FastLED.h>. FastLED's RMT4 driver (what we compile: FastLED
+// 3.10.3 on IDF 4.4.7, which is < 5.0 so RMT5 is unavailable) waits on its
+// gTX_sem semaphore with portMAX_DELAY. If the RMT interrupt gets swallowed the
+// semaphore is never released and FastLED.show() NEVER RETURNS — the board hard
+// freezes on its last frame with the LEDs latched on. FastLED documents this in
+// platforms/esp/32/rmt_4/idf4_rmt_impl.cpp. Bounding the wait turns a permanent
+// lockup into a single dropped frame.
+#define FASTLED_RMT_MAX_TICKS_FOR_GTX_SEM (2000 / portTICK_PERIOD_MS)
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Update.h>
 #include <Preferences.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
+
+// If loop() ever stalls this long, the watchdog resets the board (instead of
+// freezing forever) and the reset reason reports TASK_WDT — which distinguishes
+// a software hang from a power/brown-out deadlock, where the CPU isn't running
+// at all and the watchdog could never fire.
+#define LOOP_WDT_SECONDS 8
 #include <time.h>
 #include <FastLED.h>
 
@@ -82,6 +100,26 @@ WebServer   server(80);
 bool     settingsDirty   = false;
 uint32_t settingsDirtyMs = 0;
 void markSettingsDirty() { settingsDirty = true; settingsDirtyMs = millis(); }
+
+// Why the chip last reset. Reported on serial at boot and exposed via /state,
+// so a fault that only happens off-USB can still be diagnosed after the fact.
+// BROWNOUT => power delivery. panic/wdt => firmware bug.
+const char* gResetReason = "?";
+const char* resetReasonStr(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+  }
+}
 
 // Calibration cursor.
 int  calDigit = 0;
@@ -434,12 +472,14 @@ void sendState() {
     else fmtCounter((timerRemaining() + 999) / 1000, disp, sizeof(disp));
   }
 
-  char buf[380];
+  char buf[440];
   snprintf(buf, sizeof(buf),
-           "{\"mode\":\"%s\",\"disp\":\"%s\",\"running\":%d,"
+           "{\"rst\":\"%s\",\"up\":%lu,"
+           "\"mode\":\"%s\",\"disp\":\"%s\",\"running\":%d,"
            "\"brightness\":%u,\"color\":\"%06X\",\"colon\":\"%06X\","
            "\"effect\":%u,\"speed\":%u,\"fmt\":%u,\"cblink\":%d,\"tdur\":%u,"
            "\"ndim\":%d,\"nstart\":%u,\"nend\":%u,\"nbright\":%u,\"nactive\":%d}",
+           gResetReason, (unsigned long)(millis() / 1000),
            modeStr, disp, running ? 1 : 0,
            settings.brightness, settings.color & 0xFFFFFF, settings.colonColor & 0xFFFFFF,
            settings.effect, settings.speed, settings.use12h ? 12 : 24,
@@ -604,12 +644,26 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println(F("\n\n7-seg WS2812 clock booting..."));
+  gResetReason = resetReasonStr(esp_reset_reason());
+  Serial.printf("Last reset reason: %s\n", gResetReason);
+
+  // Check the return codes — silently discarding them means "the watchdog didn't
+  // fire" is an assumption, not evidence.
+  esp_err_t wdtInit = esp_task_wdt_init(LOOP_WDT_SECONDS, true);  // true = reset on timeout
+  esp_err_t wdtAdd  = esp_task_wdt_add(NULL);                     // watch the loop task
+  Serial.printf("Task WDT: init=%d add=%d (0 = armed OK, %ds timeout)\n",
+                (int)wdtInit, (int)wdtAdd, LOOP_WDT_SECONDS);
 
   loadSettings();
   timerRemainMs_ = (uint32_t)settings.timerDur * 1000;   // preload timer
 
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, LED_COUNT);
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MILLIAMPS);  // brown-out guard
+  // Caps LED draw so a bright frame can't sag the shared rail and brown out the
+  // ESP32 (see MAX_MILLIAMPS in config.h for the measurements). Earlier attempts
+  // at this looked like they *caused* hangs — that was actually the RMT gTX_sem
+  // deadlock noted at the top of this file, which hit any solid color regardless
+  // of current. With that bounded, the limiter does its actual job.
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MILLIAMPS);
   applySettings();     // sets brightness + colors from saved settings
   clearAll();
   FastLED.show();
@@ -633,6 +687,7 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();      // loop is alive
   handleSerial();
   server.handleClient();
 
@@ -663,4 +718,10 @@ void loop() {
     }
   }
   // calibrate / color-map modes only redraw on command
+
+  // Yield to the scheduler. Without this the solid path (which spends only ~4%
+  // of wall time in show(), vs ~27% for the effects) spins thousands of times a
+  // second through handleClient(), piling on interrupt pressure — the conditions
+  // under which the RMT interrupt gets swallowed and show() deadlocks.
+  delay(1);
 }

@@ -19,11 +19,30 @@
 // power-ons gentle until the PSU / power-injection is verified.
 #define DEFAULT_BRIGHTNESS 40     // 0-255
 
-// Global current cap. FastLED auto-scales brightness at show() time so a frame
-// can never pull more than this, which keeps a bright config from sagging the
-// shared 5 V rail and browning out / reset-looping the ESP32. Plenty bright for
-// a clock; raise it if you add proper power injection.
-#define MAX_MILLIAMPS 8000        // 8 A @ 5 V
+// Global current cap, enforced by FastLED at show() time (it scales brightness
+// down only on frames that would exceed the budget).
+//
+// This is NOT about PSU capacity — the LRS-320-5 has 60 A and is injected at the
+// string start and midpoint. It's about the ESP32 browning out when the LED
+// string sags the shared rail. Measured on this build:
+//     solid amber @100  ~1.6 A  -> stable
+//     rainbow     @149  ~2.4 A  -> stable
+//     solid white @149  ~4.9 A  -> brown-out, and unrecoverable: the WS2812s
+//                                  latch the white frame, hold the rail down,
+//                                  and it can never boot to clear them.
+//     solid white @60   ~2.0 A  -> stable
+//     solid white @100  ~3.3 A  -> BROWN-OUT (rst=BROWNOUT), auto-recovers
+//
+// HONEST CAVEAT: this cap does not actually prevent the brown-out. White @100
+// should have been scaled to 2.5 A and been as safe as white @60, and it still
+// browned out — so the trigger is most likely the *transient* step in draw when
+// a frame jumps brighter, which capacitance absorbs and a current cap cannot.
+// Kept as cheap insurance against the most extreme frames, not as a fix.
+//
+// The real fix (and the way to raise the ceiling) is hardware: bulk capacitance
+// across the ESP32's 5 V/GND, and/or feeding the board from the PSU terminals
+// rather than downstream of the LED current path.
+#define MAX_MILLIAMPS 2500        // 2.5 A @ 5 V
 
 // ---------- Chain layout ----------
 // Chain blocks, walking from the data-input end:
